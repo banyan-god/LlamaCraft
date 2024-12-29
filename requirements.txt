@@ -1,0 +1,10 @@
+numpy
+pytest
+requests
+sentencepiece
+torch
+tqdm
+wandb
+bitsandbytes
+datasets
+transformers
