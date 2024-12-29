@@ -61,8 +61,8 @@ class Task:
         
     def initialize(self):
         #dataset from finewebedullama2-preprocess 
-        train_dataset = load_from_disk('/workspace/data/tokenized_datasets')
-        val_dataset = load_from_disk('/workspace/data/tokenized_val_datasets')
+        train_dataset = load_from_disk('data/tokenized_datasets')
+        val_dataset = load_from_disk('data/tokenized_val_datasets')
         train_dataset = train_dataset.with_format("torch")
         val_dataset = val_dataset.with_format("torch")
 
