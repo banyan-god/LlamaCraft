@@ -257,7 +257,7 @@ batch_generator = iter_batches(split="train",start_index=0)
 # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model  # unwrap DDP container if needed
+raw_model = model.module if hasattr(model, "module") else model
 running_mfu = -1.0
 X, Y = None, None
 try:
