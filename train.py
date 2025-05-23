@@ -31,6 +31,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from finewebedullama2 import Task
 from export import model_export
 
+#---
+from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+from torchao.utils import TORCH_VERSION_AT_LEAST_2_5
+
+if not TORCH_VERSION_AT_LEAST_2_5:
+    raise AssertionError("torchao.float8 requires PyTorch version 2.5 or greater")
+
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
@@ -192,6 +199,7 @@ if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
+convert_to_float8_training(model, config=config)
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
