@@ -3,10 +3,7 @@ import struct
 import inspect
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
-try:
-    import bitsandbytes as bnb
-except ImportError:
-    bnb = None
+from torchao.optim import AdamW8bit, AdamW4bit, AdamWFp8
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -288,19 +285,19 @@ class Transformer(nn.Module):
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create optimizer: fused 8-bit AdamW if available and using CUDA, else fallback to CPU AdamW
-        use_fused = (
-            bnb is not None
-            and 'fused' in inspect.signature(bnb.optim.AdamW8bit).parameters
-            and device_type == 'cuda'
-        )
-        if use_fused:
-            optimizer = bnb.optim.AdamW8bit(optim_groups, lr=learning_rate, betas=betas, fused=True)
-            print("using fused AdamW8bit")
-        else:
-            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
-            print("using torch.optim.AdamW fallback")
-
+        # # Create optimizer: fused 8-bit AdamW if available and using CUDA, else fallback to CPU AdamW
+        # use_fused = (
+        #     bnb is not None
+        #     and 'fused' in inspect.signature(bnb.optim.AdamW8bit).parameters
+        #     and device_type == 'cuda'
+        # )
+        # if use_fused:
+        #     optimizer = bnb.optim.AdamW8bit(optim_groups, lr=learning_rate, betas=betas, fused=True)
+        #     print("using fused AdamW8bit")
+        # else:
+        #     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
+        #     print("using torch.optim.AdamW fallback")
+        optimizer = AdamW8bit(optim_groups, lr=learning_rate, betas=betas, fused=True)
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
