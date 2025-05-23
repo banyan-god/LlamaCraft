@@ -26,11 +26,7 @@ from functools import partial
 import torch
 from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
-# Switched from classic DDP to Fully‑Sharded Data Parallel
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-
-import bitsandbytes as bnb
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from finewebedullama2 import Task
 from export import model_export
@@ -136,7 +132,7 @@ ctx = (
 )
 print(ptdtype)
 
-data=Task(batch_size,device,max_seq_len);
+data=Task(batch_size,device,1024);
 # task-specific setup
 iter_batches = partial(
     data.iter_batches
@@ -191,37 +187,25 @@ model.to(device)
 scaler = torch.amp.GradScaler('cuda',enabled=(dtype == "float16"))
 
 # optimizer
-optimizer = bnb.optim.Adam8bit(
-    model.parameters(),
-    lr=learning_rate,
-    betas=(beta1, beta2),
-    weight_decay=weight_decay,
-)
-
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
-
-
-# wrap model into FSDP container (full‑shard for lower VRAM)
-if ddp:
-    mp_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    )
-    model = FSDP(
-        model,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        mixed_precision=mp_policy,
-        device_id=ddp_local_rank,
-    )
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
+
+# wrap model into DDP container
+if ddp:
+    # Ignore the `freqs_cis` buffer so that DDP does not broadcast it at
+    # construction time since NCCL does not support `ComplexFloat`
+    prefix = "_orig_mod." if compile else ""
+    model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
+    model = DDP(model, device_ids=[ddp_local_rank])
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -264,9 +248,8 @@ batch_generator = iter_batches(split="train",start_index=0)
 # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
-raw_model = model.module if hasattr(model, "module") else model
+raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
-X, Y = None, None
 try:
     while True:
         # determine and set the learning rate for this iteration

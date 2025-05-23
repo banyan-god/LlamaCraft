@@ -11,7 +11,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class ModelArgs:
@@ -258,8 +257,7 @@ class Transformer(nn.Module):
         freqs_sin = self.freqs_sin[:seqlen]
 
         for layer in self.layers:
-            # activation checkpointing to cut memory use ~50 %
-            h = checkpoint(layer, h, freqs_cos, freqs_sin)
+            h = layer(h, freqs_cos, freqs_sin)
         h = self.norm(h)
 
         if targets is not None:
