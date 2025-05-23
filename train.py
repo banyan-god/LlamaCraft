@@ -26,7 +26,11 @@ from functools import partial
 import torch
 from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
+# Switched from classic DDP to Fully‑Sharded Data Parallel
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import enable_wrap, wrap
+
+import bitsandbytes as bnb
 
 from finewebedullama2 import Task
 from export import model_export
@@ -187,7 +191,13 @@ model.to(device)
 scaler = torch.amp.GradScaler('cuda',enabled=(dtype == "float16"))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = bnb.optim.Adam8bit(
+    model.parameters(),
+    lr=learning_rate,
+    betas=(beta1, beta2),
+    weight_decay=weight_decay,
+)
+
 if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
@@ -198,13 +208,12 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
 
-# wrap model into DDP container
+# wrap model into FSDP container (full‑shard for lower VRAM)
 if ddp:
-    # Ignore the `freqs_cis` buffer so that DDP does not broadcast it at
-    # construction time since NCCL does not support `ComplexFloat`
-    prefix = "_orig_mod." if compile else ""
-    model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
-    model = DDP(model, device_ids=[ddp_local_rank])
+    # Auto‑wrap every sub‑module so parameters, grads and optimizer states are sharded
+    with enable_wrap(wrapper_cls=FSDP, mixed_precision=torch.bfloat16):
+        model = wrap(model)
+    model = FSDP(model, mixed_precision=torch.bfloat16, device_id=ddp_local_rank)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
