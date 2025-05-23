@@ -1,318 +1,224 @@
-# Requires: pip install pytest transformers sentencepiece torch
+# Requires: pip install pytest transformers datasets torch accelerate bitsandbytes
 import pytest
 import torch
 from transformers import AutoTokenizer
-import torch.optim as optim # For checking optimizer in GRPOPolicy
 
 # Assuming model.py and train_rl.py are in the same directory or in PYTHONPATH
 # Add project root to sys.path if necessary for imports to work in test environment
 import sys
 import os
-# This assumes the tests are run from the root of the repository or that model.py and train_rl.py are findable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.'))) 
 
-from model import Transformer, ModelArgs
-from train_rl import RLEnvironment, load_pretrained_model, GRPOPolicy
+# Import functions to be tested from train_rl.py (refactored for GRPOTrainer)
+from train_rl import (
+    extract_gsm8k_ground_truth_answer,
+    extract_answer_from_completion,
+    reasoning_reward_function,
+    # prepare_prompts function is defined inside run_grpo_training, 
+    # so we'll define a similar one for testing or test its effect via dataset mapping.
+    # For now, let's define a test version or assume its logic is simple.
+)
+
+# --- Fixtures ---
 
 @pytest.fixture(scope="module") 
 def tokenizer_fixture():
     """Fixture to provide a Hugging Face tokenizer."""
     try:
-        tokenizer_name = "KoboldAI/llama2-tokenizer"
+        # Using a common, small tokenizer for tests to avoid large downloads if not cached
+        tokenizer_name = "gpt2" # "KoboldAI/llama2-tokenizer" is larger
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-        if tokenizer.bos_token_id is None: 
-             if hasattr(tokenizer, 'bos_token') and isinstance(tokenizer.bos_token, str):
-                tokenizer.bos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.bos_token)
-             if tokenizer.bos_token_id is None: 
-                tokenizer.bos_token_id = 1 
-        if tokenizer.eos_token_id is None: 
-            if hasattr(tokenizer, 'eos_token') and isinstance(tokenizer.eos_token, str):
-                tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
-            if tokenizer.eos_token_id is None:
-                tokenizer.eos_token_id = 2 
+        # GPT2 specific BOS/EOS if needed, though not strictly required for reward function tests
+        # if tokenizer.bos_token_id is None: tokenizer.bos_token_id = tokenizer.eos_token_id 
+        # if tokenizer.eos_token_id is None: tokenizer.eos_token_id = 50256
         return tokenizer
     except Exception as e:
         pytest.skip(f"Failed to load tokenizer {tokenizer_name}, skipping tests that need it: {e}")
-
-
-@pytest.fixture(scope="module")
-def dummy_model_fixture(tokenizer_fixture):
-    """Fixture to provide a dummy Transformer model."""
-    model_args = ModelArgs(
-        dim=64, 
-        n_layers=1, 
-        n_heads=2, 
-        vocab_size=tokenizer_fixture.vocab_size, 
-        max_seq_len=128 
-    )
-    model = Transformer(model_args)
-    # Ensure model parameters require gradients for update test
-    for param in model.parameters():
-        param.requires_grad_(True)
-    return model
 
 @pytest.fixture(scope="session") 
 def device_fixture():
     """Fixture to provide the device for torch tensors."""
     return "cuda" if torch.cuda.is_available() else "cpu"
 
-@pytest.fixture(scope="function") # Use function scope for tmp_path to get a fresh dir each test
-def dummy_checkpoint_fixture(tmp_path, dummy_model_fixture):
-    """Fixture to create and save a dummy checkpoint."""
-    dummy_model = dummy_model_fixture
-    # model_args should be a dict, vars() works well for dataclasses like ModelArgs
-    model_args_dict = vars(dummy_model.params) 
+# --- Tests for Reward Function Components ---
+
+def test_extract_gsm8k_ground_truth_answer_logic():
+    """Test extraction of ground truth answers from GSM8K format."""
+    assert extract_gsm8k_ground_truth_answer("The answer is #### 123") == "123"
+    assert extract_gsm8k_ground_truth_answer("Some other text #### 456.78 then more.") == "456.78"
+    assert extract_gsm8k_ground_truth_answer("Final Answer: #### 1,000") == "1,000"
+    assert extract_gsm8k_ground_truth_answer("The final answer is ####3.14.") == "3.14" # Space variation
+    assert extract_gsm8k_ground_truth_answer("The final answer is ####  0.5  .") == "0.5" # More spaces and trailing dot
     
-    checkpoint = {
-        "model": dummy_model.state_dict(),
-        "model_args": model_args_dict,
-        "iter_num": 100, # Example additional data
-        "best_val_loss": 0.5, # Example additional data
-        "config": {"lr": 0.001} # Example additional data
+    # Fallback logic tests (if implemented in train_rl.py to find last number)
+    assert extract_gsm8k_ground_truth_answer("The answer is 123") == "123" # Assuming fallback
+    assert extract_gsm8k_ground_truth_answer("Answer: 456.78.") == "456.78" # Assuming fallback
+    assert extract_gsm8k_ground_truth_answer("No #### but result 1,000.") == "1,000" # Assuming fallback
+
+    # Negative cases
+    assert extract_gsm8k_ground_truth_answer("No number here ####") is None
+    assert extract_gsm8k_ground_truth_answer("Only text here") is None
+    assert extract_gsm8k_ground_truth_answer("#### (no number after)") is None
+    assert extract_gsm8k_ground_truth_answer("The price is $50 but this is not the format.") == "50" # Fallback picks last number
+
+def test_extract_answer_from_completion_logic():
+    """Test extraction of numerical answers from model completions."""
+    assert extract_answer_from_completion("The model thinks the answer is 123.") == "123"
+    assert extract_answer_from_completion("So, the final value is 456.78.") == "456.78"
+    assert extract_answer_from_completion("It might be 1,000, I guess.") == "1,000"
+    assert extract_answer_from_completion("The result is 3.14") == "3.14"
+    assert extract_answer_from_completion("The result is 0.5 .") == "0.5" # Trailing dot
+    assert extract_answer_from_completion("The result is 5,000.00.") == "5,000.00"
+
+    # Cases with multiple numbers (should pick the last one)
+    assert extract_answer_from_completion("First try 1, then try 2, finally 3.") == "3"
+    assert extract_answer_from_completion("Step 1: 10. Step 2: 20. Final answer: 30.") == "30"
+
+    # Negative cases
+    assert extract_answer_from_completion("There is no number here.") is None
+    assert extract_answer_from_completion("The answer is five.") is None # Word, not number
+    assert extract_answer_from_completion("The model is unsure.") is None
+
+# --- Tests for reasoning_reward_function ---
+
+def test_reasoning_reward_function_correct_answer():
+    prompts = ["What is 2+2?"]
+    completions = ["The answer is <<2+2=4>>4."] # Completion contains "4"
+    # Dummy completions_ids, not used by this reward function logic
+    completions_ids = [[101, 102]] 
+    kwargs = {"answer": ["Question: What is 2+2?\nAnswer: The final answer is #### 4"]}
+    
+    rewards = reasoning_reward_function(prompts, completions, completions_ids, **kwargs)
+    assert len(rewards) == 1
+    assert rewards[0] == 1.0, "Reward should be 1.0 for correct numerical answer"
+
+def test_reasoning_reward_function_correct_answer_float():
+    prompts = ["What is 10/4?"]
+    completions = ["The answer is 2.5"] 
+    completions_ids = [[101, 102]] 
+    kwargs = {"answer": ["Question: What is 10/4?\nAnswer: The final answer is #### 2.5"]}
+    
+    rewards = reasoning_reward_function(prompts, completions, completions_ids, **kwargs)
+    assert len(rewards) == 1
+    assert rewards[0] == 1.0, "Reward should be 1.0 for correct float answer"
+
+def test_reasoning_reward_function_incorrect_answer():
+    prompts = ["What is 2+2?"]
+    completions = ["I think it is <<2+2=5>>5."] # Completion contains "5"
+    completions_ids = [[101, 102]]
+    kwargs = {"answer": ["Question: What is 2+2?\nAnswer: The final answer is #### 4"]}
+    
+    rewards = reasoning_reward_function(prompts, completions, completions_ids, **kwargs)
+    assert len(rewards) == 1
+    assert rewards[0] < 0.0, "Reward should be negative for incorrect answer (e.g., -0.1)"
+    assert rewards[0] == -0.1, "Expected -0.1 for incorrect but parsable answer"
+
+def test_reasoning_reward_function_no_answer_in_completion():
+    prompts = ["What is 2+2?"]
+    completions = ["I am not sure about that calculation."] # No numerical answer
+    completions_ids = [[101, 102]]
+    kwargs = {"answer": ["Question: What is 2+2?\nAnswer: The final answer is #### 4"]}
+    
+    rewards = reasoning_reward_function(prompts, completions, completions_ids, **kwargs)
+    assert len(rewards) == 1
+    # Expected penalty for not finding an answer in completion, e.g., -0.3
+    # This might also be affected by short completion penalty if applicable
+    expected_reward = -0.3 
+    if len(completions[0]) < 30: # Check if short completion penalty applies
+        expected_reward -= 0.1
+    assert rewards[0] == pytest.approx(expected_reward), "Reward should reflect penalty for no parsable answer in completion"
+
+
+def test_reasoning_reward_function_gt_missing_format():
+    prompts = ["What is 2+2?"]
+    completions = ["The answer is 4."] # Model gives correct number
+    completions_ids = [[101, 102]]
+    # Ground truth is missing the "#### <number>" format but has a fallback number
+    kwargs = {"answer": ["Question: What is 2+2?\nAnswer: The final answer is four, which is 4."]} 
+    
+    rewards = reasoning_reward_function(prompts, completions, completions_ids, **kwargs)
+    assert len(rewards) == 1
+    # If GT fallback extracts "4", and completion extracts "4", reward should be 1.0
+    assert rewards[0] == 1.0, "Reward should be 1.0 if GT fallback and completion match"
+
+def test_reasoning_reward_function_gt_unparsable():
+    prompts = ["What is 2+2?"]
+    completions = ["The answer is 4."]
+    completions_ids = [[101, 102]]
+    # Ground truth is unparsable by extract_gsm8k_ground_truth_answer
+    kwargs = {"answer": ["Question: What is 2+2?\nAnswer: It's just four."]} 
+    
+    rewards = reasoning_reward_function(prompts, completions, completions_ids, **kwargs)
+    assert len(rewards) == 1
+    # Expected penalty for GT answer not being parsable, e.g., -0.5
+    assert rewards[0] == -0.5, "Reward should reflect penalty for unparsable GT answer"
+
+
+def test_reasoning_reward_function_batch():
+    prompts = ["Q1: 2+2?", "Q2: 3*3?", "Q3: 10/2?"]
+    completions = ["It is 4.", "The result is 9", "I think it is 6."]
+    completions_ids = [[1,2],[3,4],[5,6]] # Dummy
+    kwargs = {
+        "answer": [
+            "Q1: Answer is #### 4",
+            "Q2: Answer is #### 9",
+            "Q3: Answer is #### 5" 
+        ]
     }
+    rewards = reasoning_reward_function(prompts, completions, completions_ids, **kwargs)
+    assert len(rewards) == 3
+    assert rewards[0] == 1.0 # Q1: Correct
+    assert rewards[1] == 1.0 # Q2: Correct
+    assert rewards[2] == -0.1 # Q3: Incorrect (6 vs 5)
+
+def test_reasoning_reward_function_mismatched_lengths_kwargs():
+    """Test behavior when completions and kwargs['answer'] have different lengths."""
+    prompts = ["Q1", "Q2"]
+    completions = ["Ans1", "Ans2"]
+    completions_ids = [[1],[2]]
+    kwargs_mismatched = {"answer": ["GT_Ans1"]} # Only one GT answer for two completions
+
+    rewards = reasoning_reward_function(prompts, completions, completions_ids, **kwargs_mismatched)
+    assert len(rewards) == len(completions), "Should return rewards for all completions"
+    # Expect default reward (e.g., 0.0) for all if it cannot process due to mismatch
+    assert all(r == 0.0 for r in rewards), "Expected default rewards for mismatched lengths"
+
+# --- Tests for Dataset Preparation Logic ---
+# The prepare_prompts function is defined within run_grpo_training in train_rl.py.
+# To test it directly, we either need to extract it or replicate its simple logic here.
+# For this test, we'll replicate its core transformation.
+
+def test_prepare_prompts_mapping_replication():
+    """
+    Tests the logic similar to prepare_prompts used in dataset.map().
+    """
+    def prepare_prompts_for_test(example): # Replicating the mapping function
+        return {"prompt": example["question"], "answer": example["answer"]}
+
+    dummy_gsm8k_example = {"question": "What is 3 multiplied by 7?", 
+                           "answer": "To find 3 multiplied by 7, we calculate 3 * 7 = 21. #### 21",
+                           "extra_info": "This is a multiplication problem."}
     
-    ckpt_path = tmp_path / "dummy_ckpt.pt"
-    torch.save(checkpoint, ckpt_path)
+    processed_example = prepare_prompts_for_test(dummy_gsm8k_example)
     
-    return str(ckpt_path), model_args_dict # Return path as string and original args
-
-
-# --- Tests for RLEnvironment ---
-
-def test_env_initialization(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test RLEnvironment initialization."""
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture)
-    assert env.tokenizer == tokenizer_fixture
-    assert env.device == device_fixture
-    expected_max_seq_len = dummy_model_fixture.params.max_seq_len
-    if hasattr(tokenizer_fixture, 'model_max_length') and tokenizer_fixture.model_max_length < 10000:
-         expected_max_seq_len = tokenizer_fixture.model_max_length
-    assert env.max_seq_len == expected_max_seq_len
-    assert env.get_action_space_size() == tokenizer_fixture.vocab_size
-
-def test_env_reset_empty_prompt(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test RLEnvironment reset with an empty prompt."""
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture)
-    state = env.reset(initial_prompt_text="")
-    assert isinstance(state, torch.Tensor)
-    assert state.device.type == device_fixture
-    if tokenizer_fixture.bos_token_id is not None:
-        assert state.tolist() == [[tokenizer_fixture.bos_token_id]]
-    else:
-        assert state.nelement() > 0
-
-def test_env_reset_with_prompt(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test RLEnvironment reset with a specific prompt."""
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture)
-    prompt = "Hello world"
-    state = env.reset(initial_prompt_text=prompt)
-    expected_ids = tokenizer_fixture.encode(prompt, add_special_tokens=True, return_tensors="pt")
-    assert isinstance(state, torch.Tensor)
-    assert torch.equal(state, expected_ids.to(device_fixture))
-    assert state.device.type == device_fixture
-
-def test_env_step(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test a single step in the RLEnvironment."""
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture)
-    initial_state = env.reset(initial_prompt_text="Test")
-    initial_len = initial_state.size(1)
-    action = 50 
-    if action == tokenizer_fixture.eos_token_id: action = 51
-    if action == tokenizer_fixture.eos_token_id: action = 52 # Highly unlikely
-    next_state, reward, done = env.step(action)
-    assert isinstance(next_state, torch.Tensor)
-    assert next_state.size(1) == initial_len + 1
-    assert next_state[0, -1].item() == action
-    assert isinstance(reward, float)
-    assert isinstance(done, bool)
-    if env.max_seq_len > initial_len + 1 and (tokenizer_fixture.eos_token_id is None or action != tokenizer_fixture.eos_token_id):
-        assert not done
-
-def test_env_step_done_eos(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test if 'done' is True when EOS token is the action."""
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture)
-    env.reset() 
-    if tokenizer_fixture.eos_token_id is None:
-        pytest.skip("Tokenizer does not have an EOS token ID defined.")
-    action = tokenizer_fixture.eos_token_id
-    _, _, done = env.step(action)
-    assert done
-
-def test_env_step_done_max_length(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test if 'done' is True when max sequence length is reached."""
-    test_max_len = 5 
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture, max_seq_len=test_max_len)
-    env.reset(initial_prompt_text="Hi") 
-    current_len = env.current_state.size(1)
-    non_eos_action = 100 
-    if tokenizer_fixture.eos_token_id is not None and non_eos_action == tokenizer_fixture.eos_token_id:
-        non_eos_action = 101
-    for _ in range(test_max_len - current_len - 1):
-        _, _, step_done = env.step(non_eos_action)
-        assert not step_done
-    assert env.current_state.size(1) == test_max_len - 1
-    _, _, done = env.step(non_eos_action)
-    assert env.current_state.size(1) == test_max_len
-    assert done
-
-def test_calculate_reward_basic(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Basic test for the calculate_reward method."""
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture)
-    env.reset() 
-    dummy_current_state = torch.tensor([[10, 20, 30]], dtype=torch.long, device=device_fixture)
-    action = 40 
-    if tokenizer_fixture.eos_token_id is not None and action == tokenizer_fixture.eos_token_id: action = 41
-    reward = env.calculate_reward(dummy_current_state, action)
-    assert isinstance(reward, float)
-    if tokenizer_fixture.eos_token_id is None or action != tokenizer_fixture.eos_token_id:
-         assert reward == 0.1
-
-def test_calculate_reward_eos(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test reward calculation for EOS action."""
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture)
-    env.reset()
-    dummy_current_state = torch.tensor([[10, 20, 30]], dtype=torch.long, device=device_fixture)
-    if tokenizer_fixture.eos_token_id is None:
-        pytest.skip("Tokenizer does not have an EOS token ID defined for this test.")
-    action = tokenizer_fixture.eos_token_id
-    reward = env.calculate_reward(dummy_current_state, action)
-    assert isinstance(reward, float)
-    assert reward == 0.0
-
-def test_calculate_reward_repetition(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test reward calculation for repetitive sequence."""
-    env = RLEnvironment(model_for_max_len=dummy_model_fixture, tokenizer=tokenizer_fixture, device=device_fixture)
-    env.reset()
-    repetitive_state = torch.tensor([[10, 20, 30, 10, 20, 30]], dtype=torch.long, device=device_fixture)
-    action = 40 
-    if tokenizer_fixture.eos_token_id is not None and action == tokenizer_fixture.eos_token_id: action = 41
-    reward = env.calculate_reward(repetitive_state, action)
-    assert isinstance(reward, float)
-    assert reward == 0.1 - 0.5
-
-# --- Tests for load_pretrained_model ---
-
-def test_load_pretrained_model(dummy_checkpoint_fixture, device_fixture):
-    """Test loading a model from a dummy checkpoint."""
-    ckpt_path, original_model_args_dict = dummy_checkpoint_fixture
+    assert "prompt" in processed_example, "Output should have a 'prompt' key"
+    assert "answer" in processed_example, "Output should have an 'answer' key"
+    assert processed_example["prompt"] == dummy_gsm8k_example["question"], "'prompt' field mismatch"
+    assert processed_example["answer"] == dummy_gsm8k_example["answer"], "'answer' field mismatch"
     
-    loaded_model = load_pretrained_model(checkpoint_path=ckpt_path, device=device_fixture)
-    
-    assert loaded_model is not None, "Loaded model should not be None"
-    assert isinstance(loaded_model, Transformer), "Loaded model should be an instance of Transformer"
-    
-    # Compare ModelArgs parameters
-    assert loaded_model.params.dim == original_model_args_dict['dim'], "Dimension mismatch"
-    assert loaded_model.params.vocab_size == original_model_args_dict['vocab_size'], "Vocab size mismatch"
-    assert loaded_model.params.n_layers == original_model_args_dict['n_layers'], "Number of layers mismatch"
-    
-    # Perform a basic forward pass
-    # Ensure input tensor is on the same device as the model
-    dummy_input = torch.tensor([[1, 2, 3]], dtype=torch.long).to(device_fixture)
-    try:
-        logits, loss = loaded_model(dummy_input) # Model might return loss as well if targets are passed
-        assert logits is not None, "Logits should not be None after forward pass"
-        # If your model's forward pass always returns loss (even if None), that's fine.
-        # If it only returns loss when targets are provided, this test is okay.
-    except Exception as e:
-        pytest.fail(f"Loaded model failed forward pass: {e}")
+    # Check that other columns are not implicitly carried over by this simple function
+    # (though the .map(remove_columns=...) in train_rl.py handles the final dataset structure)
+    assert "extra_info" not in processed_example, "Other columns should not be in the output of this specific function"
+    assert "question" not in processed_example, "Original 'question' key should be replaced by 'prompt' or removed by map in actual script"
 
-# --- Tests for GRPOPolicy ---
+# Note: A more integrated test for dataset preparation would involve
+# creating a dummy Hugging Face Dataset object and applying the .map()
+# call with the actual prepare_prompts function and remove_columns argument
+# from train_rl.py. However, that's closer to an integration test.
+# This unit test focuses on the transformation logic itself.
 
-def test_grpo_policy_initialization(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test GRPOPolicy initialization."""
-    model = dummy_model_fixture.to(device_fixture) # Ensure model is on the correct device
-    tokenizer = tokenizer_fixture
-    
-    policy = GRPOPolicy(model=model, tokenizer=tokenizer, device=device_fixture, learning_rate=1e-4)
-    
-    assert policy.model == model, "Model not set correctly in policy"
-    assert policy.device == device_fixture, "Device not set correctly in policy"
-    assert policy.tokenizer == tokenizer, "Tokenizer not set correctly in policy"
-    assert isinstance(policy.optimizer, optim.AdamW), "Optimizer is not AdamW"
-    
-    # Check if optimizer has parameters
-    assert len(policy.optimizer.param_groups) > 0, "Optimizer has no param groups"
-    assert len(policy.optimizer.param_groups[0]['params']) > 0, "Optimizer has no parameters in the first group"
-    # Check that a model parameter is indeed part of the optimizer's parameters
-    assert any(model_param is opt_param for opt_param in policy.optimizer.param_groups[0]['params'] for model_param in model.parameters()), "Model parameters not in optimizer"
-
-
-def test_grpo_policy_select_action(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test GRPOPolicy select_action method."""
-    model = dummy_model_fixture.to(device_fixture)
-    tokenizer = tokenizer_fixture
-    policy = GRPOPolicy(model=model, tokenizer=tokenizer, device=device_fixture)
-    
-    prompt = "Test prompt for action selection"
-    # Encode prompt and ensure it's on the correct device
-    state = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=True).to(device_fixture)
-    
-    # Handle case where encoding might result in an empty tensor (e.g. if prompt is only special tokens that are filtered)
-    if state.nelement() == 0 or state.size(1) == 0:
-        if tokenizer.bos_token_id is not None:
-            state = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long, device=device_fixture)
-        else: # Fallback if BOS is also None
-            state = torch.tensor([[1]], dtype=torch.long, device=device_fixture) # Use a generic token
-
-    action, log_prob = policy.select_action(state)
-    
-    assert isinstance(action, int), "Action should be an integer"
-    assert 0 <= action < tokenizer.vocab_size, f"Action {action} out of vocab range [0, {tokenizer.vocab_size-1}]"
-    assert isinstance(log_prob, torch.Tensor), "Log probability should be a torch.Tensor"
-    assert log_prob.shape == (), "Log probability should be a scalar tensor"
-    assert log_prob.device.type == device_fixture, "Log probability is on the wrong device"
-
-def test_grpo_policy_update_basic(dummy_model_fixture, tokenizer_fixture, device_fixture):
-    """Test basic functionality of GRPOPolicy update_policy method."""
-    model = dummy_model_fixture.to(device_fixture)
-    tokenizer = tokenizer_fixture
-    
-    # Ensure model is in training mode for the update
-    model.train()
-    
-    policy = GRPOPolicy(model=model, tokenizer=tokenizer, device=device_fixture, learning_rate=1e-3)
-    
-    # Get initial state of a parameter to check if it changes
-    # Accessing a specific parameter, e.g., from the first attention layer's query matrix
-    # This might need adjustment if model structure changes.
-    param_to_check = model.layers[0].attention.wq.weight
-    initial_param_value = param_to_check.clone().detach()
-    
-    # Dummy data for update
-    rewards = [0.1, 0.2, 0.05]
-    # Create log_probs that require gradients
-    log_probs = [
-        torch.tensor(-0.5, device=device_fixture, requires_grad=True),
-        torch.tensor(-0.2, device=device_fixture, requires_grad=True),
-        torch.tensor(-0.8, device=device_fixture, requires_grad=True)
-    ]
-    
-    policy.update_policy(rewards, log_probs)
-    
-    updated_param_value = param_to_check.clone().detach()
-    
-    # Assert that parameters have changed (optimizer step was called and grads were non-zero)
-    assert not torch.equal(initial_param_value, updated_param_value), \
-        "Model parameter did not change after policy update. Check learning rate, gradients, or optimizer."
-
-    # Check if requires_grad is still True for model parameters after update (it should be)
-    for param in model.parameters():
-        assert param.requires_grad, "Model parameter lost requires_grad after update"
-
-    # Further check: ensure log_probs are detached or don't have grad_fn if they were part of a larger graph not intended
-    # In REINFORCE, log_probs are typically leaves in the loss computation for THIS update step.
-    # The policy.update_policy method calculates loss and calls backward.
-    # The original log_prob tensors passed in might still have requires_grad=True if they were created that way.
-    # This is generally fine.
-    assert log_probs[0].requires_grad, "Original log_prob tensor's requires_grad status changed unexpectedly."
-
-    # Test with empty rewards/log_probs (should not error)
-    try:
-        policy.update_policy([], [])
-        policy.update_policy([0.1], []) # Mismatched lengths, current impl might handle, but good to be aware
-        policy.update_policy([], [torch.tensor(-0.1, requires_grad=True)])
-    except Exception as e:
-        pytest.fail(f"policy.update_policy failed with empty or mismatched inputs: {e}")
+# Removed GRPOTrainer instantiation test as it would require significant mocking
+# or actual model/config setup, making it more of an integration test.
+# The focus here is on unit testing the reward logic and data prep function.

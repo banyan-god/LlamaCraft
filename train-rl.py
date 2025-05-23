@@ -1,364 +1,261 @@
+# Requires: pip install torch datasets transformers trl accelerate bitsandbytes
 import os
 import sys
 import torch
-from typing import Tuple, Any, List 
-import torch.optim as optim 
-import torch.nn.functional as F 
-from transformers import AutoTokenizer # Added for Hugging Face Tokenizer
+from typing import List # Keep List for type hinting reward function
+import re # Added for regex in reward function
 
-# Requires: pip install transformers sentencepiece torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import GRPOTrainer, GRPOConfig
 
-# Add the current directory to sys.path to ensure model.py can be imported
-sys.path.append(os.path.dirname(__file__))
+# Add project root to sys.path if necessary for imports to work in test environment
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.'))) 
 
-from model import Transformer, ModelArgs
-
-def load_pretrained_model(checkpoint_path: str, device: str, out_dir: str = "out") -> Transformer:
+# --- Helper functions for the reward function ---
+def extract_gsm8k_ground_truth_answer(answer_str: str) -> str | None:
     """
-    Loads a pretrained model from a checkpoint file.
+    Parses strings like "...#### 123" from GSM8K and returns the numerical part.
     """
-    if checkpoint_path is None:
-        checkpoint_path = os.path.join(out_dir, "ckpt.pt")
+    match = re.search(r"####\s*([\d\.,]+)", answer_str)
+    if match:
+        return match.group(1).strip()
+    # Fallback: if #### is not present, try to find the last number in the string
+    # This might be useful if the format is inconsistent for some reason.
+    numbers = re.findall(r"([\d\.,]+)", answer_str)
+    if numbers:
+        return numbers[-1].strip().rstrip('.')
+    return None
 
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    model_args_dict = checkpoint["model_args"]
-    # Ensure all keys in model_args_dict are valid arguments for ModelArgs
-    # This is important if the checkpoint was saved with a different set of args
-    # For now, assume compatibility or that ModelArgs handles extra/missing keys gracefully.
-    gptconf = ModelArgs(**model_args_dict)
-    model = Transformer(gptconf)
-    state_dict = checkpoint["model"]
-
-    unwanted_prefix = "_orig_mod."
-    cleaned_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith(unwanted_prefix):
-            cleaned_state_dict[k[len(unwanted_prefix):]] = v
-        else:
-            cleaned_state_dict[k] = v
-    state_dict = cleaned_state_dict
-
-    model.load_state_dict(state_dict, strict=False) # Set strict=False to handle potential mismatches gracefully
-    model.to(device)
-    model.eval() 
-    print("Pretrained model loaded successfully.")
-    return model
-
-class RLEnvironment:
+def extract_answer_from_completion(completion_str: str) -> str | None:
     """
-    Reinforcement Learning Environment for text generation.
-    Uses a Hugging Face tokenizer.
+    Extracts the final numerical answer from a model's completion string.
+    Heuristic: looks for the last number.
     """
-    def __init__(self, model_for_max_len: Transformer, tokenizer: Any, device: str, max_seq_len: int = 1024):
-        # model_for_max_len is used to potentially derive max_seq_len, not for generation within env
-        self.tokenizer = tokenizer
-        self.device = device
-        
-        # Determine max_seq_len: Use tokenizer's model_max_length if available and reasonable,
-        # otherwise use model's block_size, or fallback to provided max_seq_len.
-        if hasattr(self.tokenizer, 'model_max_length') and self.tokenizer.model_max_length < 10000: # Check for a sensible value
-            self.max_seq_len = self.tokenizer.model_max_length
-        elif hasattr(model_for_max_len, 'params') and hasattr(model_for_max_len.params, 'block_size'):
-            self.max_seq_len = model_for_max_len.params.block_size
-        else:
-            self.max_seq_len = max_seq_len
-        
-        self.current_state: torch.Tensor = None
-        print(f"RLEnvironment initialized with tokenizer: {self.tokenizer.name_or_path}, max_seq_len: {self.max_seq_len}")
-        if self.tokenizer.bos_token_id is None or self.tokenizer.eos_token_id is None:
-             print("Warning: Tokenizer BOS or EOS token ID is not set. This might cause issues.")
+    # Remove potential "Question:" or "Prompt:" prefix if the model regenerates it
+    # completion_str = re.sub(r"^(Question:|Prompt:).*\n", "", completion_str, flags=re.IGNORECASE)
 
+    # Look for numbers (integers or decimals, potentially with commas)
+    numbers = re.findall(r"([\d\.,]+)", completion_str)
+    if numbers:
+        # Return the last number found
+        return numbers[-1].strip().rstrip('.') # Remove trailing dots if any
+    return None
 
-    def reset(self, initial_prompt_text: str = "") -> torch.Tensor:
-        if not initial_prompt_text:
-            if self.tokenizer.bos_token_id is None:
-                print("Error: Tokenizer does not have a BOS token defined, and prompt is empty.")
-                # Fallback: use a common token like 0 or 1 if BOS is not defined, or raise error
-                # For now, using 1, but this should be handled based on tokenizer specifics.
-                self.current_state = torch.tensor([[1]], dtype=torch.long, device=self.device)
-            else:
-                self.current_state = torch.tensor([[self.tokenizer.bos_token_id]], dtype=torch.long, device=self.device)
-        else:
-            # Encode the prompt, ensuring add_special_tokens is handled correctly
-            # Some tokenizers add BOS by default, others need add_special_tokens=True explicitly.
-            # For Llama tokenizers, add_special_tokens=True usually adds BOS.
-            encoded_prompt = self.tokenizer.encode(initial_prompt_text, return_tensors="pt", add_special_tokens=True)
-            self.current_state = encoded_prompt.to(self.device)
-            # If encoding results in an empty tensor (e.g. tokenizer quirk or very short/special prompt)
-            if self.current_state.nelement() == 0 or self.current_state.size(1) == 0:
-                print(f"Warning: Encoding prompt '{initial_prompt_text}' resulted in empty tensor. Using BOS.")
-                if self.tokenizer.bos_token_id is not None:
-                    self.current_state = torch.tensor([[self.tokenizer.bos_token_id]], dtype=torch.long, device=self.device)
-                else: # Fallback if BOS is also None
-                    self.current_state = torch.tensor([[1]], dtype=torch.long, device=self.device)
+# --- Main Reward Function ---
+def reasoning_reward_function(prompts: list[str], completions: list[str], completions_ids: list[list[int]], **kwargs) -> list[float]:
+    """
+    Reward function for reasoning tasks, focusing on extracting and comparing final numerical answers.
+    kwargs will contain other columns from the dataset, like "answer" (ground truth for GSM8K).
+    """
+    rewards = []
+    ground_truth_answer_texts = kwargs.get("answer", []) 
 
+    # print(f"Reward Function Called. Batch size: {len(prompts)}") # Debug print
 
-        if self.current_state.dim() == 1: # Ensure it's [batch_size, seq_len]
-            self.current_state = self.current_state.unsqueeze(0)
-        
-        return self.current_state
+    if len(ground_truth_answer_texts) != len(completions):
+        print(f"Warning: Mismatch in lengths of completions ({len(completions)}) and ground_truth_answers ({len(ground_truth_answer_texts)}). Returning default rewards.")
+        return [0.0] * len(completions)
 
-    def calculate_reward(self, current_state: torch.Tensor, action: int) -> float:
-        reward = 0.1 
-        if self.tokenizer.eos_token_id is not None and action == self.tokenizer.eos_token_id:
-            reward = 0.0 
-        if current_state.size(1) >= 6: 
-            if torch.equal(current_state[0, -3:], current_state[0, -6:-3]):
-                reward -= 0.5 
-        return reward
+    for i in range(len(completions)):
+        completion_text = completions[i]
+        gt_answer_text = ground_truth_answer_texts[i]
 
-    def step(self, action: int) -> Tuple[torch.Tensor, float, bool]:
-        action_tensor = torch.tensor([[action]], dtype=torch.long, device=self.device)
-        reward = self.calculate_reward(self.current_state, action)
-        self.current_state = torch.cat((self.current_state, action_tensor), dim=1)
-        
-        done = False
-        if self.tokenizer.eos_token_id is not None and action == self.tokenizer.eos_token_id:
-            done = True
-        if self.current_state.size(1) >= self.max_seq_len:
-            done = True
+        # print(f"\nProcessing item {i}:") # Debug print
+        # print(f"  Prompt: {prompts[i][:100]}...") # Debug print
+        # print(f"  Completion: {completion_text[:150]}...") # Debug print
+        # print(f"  Ground Truth Text: {gt_answer_text[:150]}...") # Debug print
+
+        gt_final_answer = extract_gsm8k_ground_truth_answer(gt_answer_text)
+        pred_final_answer = extract_answer_from_completion(completion_text)
+
+        # print(f"  Extracted GT final answer: {gt_final_answer}") # Debug print
+        # print(f"  Extracted Predicted final answer: {pred_final_answer}") # Debug print
+
+        reward = 0.0  # Default reward
+
+        if gt_final_answer is not None and pred_final_answer is not None:
+            # Normalize for comparison: remove commas, strip whitespace
+            gt_final_answer_norm = gt_final_answer.replace(",", "").strip()
+            pred_final_answer_norm = pred_final_answer.replace(",", "").strip()
             
-        return self.current_state, reward, done
+            try:
+                # Attempt float conversion for robust numerical comparison
+                if abs(float(gt_final_answer_norm) - float(pred_final_answer_norm)) < 1e-3: # Tolerance for float comparison
+                    reward = 1.0  # Correct final answer
+                    # print("    Reward: 1.0 (Correct final answer)") # Debug print
+                else:
+                    reward = -0.1 # Incorrect final answer (but both parsable)
+                    # print("    Reward: -0.1 (Incorrect final answer)") # Debug print
+            except ValueError:
+                # Fallback to string comparison if not clearly numeric (e.g., if extraction yields non-numeric strings despite regex)
+                if gt_final_answer_norm == pred_final_answer_norm:
+                    reward = 0.8 # String match, slightly less than perfect float match
+                    # print("    Reward: 0.8 (String match on final answer)") # Debug print
+                else:
+                    reward = -0.2 # Penalize if format is weird and not matching by string
+                    # print("    Reward: -0.2 (String mismatch, format/extraction issue)") # Debug print
+        elif gt_final_answer is None:
+            # Should not happen with well-formatted gsm8k data
+            # print("    Reward: -0.5 (Could not parse ground truth answer!)") # Debug print
+            reward = -0.5 
+        else: # pred_final_answer is None, but gt_final_answer was parsable
+            # print("    Reward: -0.3 (Could not parse answer from model completion)") # Debug print
+            reward = -0.3 
+        
+        # Optional: Small penalty for very short completions if the answer was not perfect
+        if reward < 1.0 and len(completion_text) < 30: # Arbitrary short length
+            # print(f"    Short completion penalty applied. Original reward: {reward}") # Debug print
+            reward -= 0.1
+            reward = max(-1.0, reward) # Cap minimum reward
 
-    def get_action_space_size(self) -> int:
-        return self.tokenizer.vocab_size
+        rewards.append(reward)
+    
+    # print(f"Calculated rewards (batch): {rewards}") # Debug print
+    return rewards
 
-class GRPOPolicy:
+
+def run_grpo_training():
     """
-    GRPO (Generative Reward Policy Optimization) Policy/Agent.
+    Main function to run GRPO training.
     """
-    def __init__(self, model: Transformer, tokenizer: Any, device: str, learning_rate: float = 3e-4):
-        self.model = model  
-        self.device = device
-        self.tokenizer = tokenizer # Store tokenizer for vocab_size access
-        self.vocab_size = self.tokenizer.vocab_size # Use tokenizer's vocab_size
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
-        print(f"GRPOPolicy initialized with vocab_size: {self.vocab_size} (from tokenizer).")
-
-    def select_action(self, state: torch.Tensor, temperature: float = 1.0, top_k: int = 50) -> Tuple[int, torch.Tensor]:
-        logits, _ = self.model(state) 
-        last_token_logits = logits[:, -1, :]  
-        
-        if temperature != 1.0:
-            last_token_logits = last_token_logits / temperature
-        
-        if top_k is not None and top_k > 0:
-            k = min(top_k, last_token_logits.size(-1))
-            if k > 0 : 
-                v, _ = torch.topk(last_token_logits, k) 
-                last_token_logits[last_token_logits < v[:, [-1]]] = -float('Inf') 
-            
-        probs = F.softmax(last_token_logits, dim=-1) 
-        
-        if torch.isnan(probs).any() or torch.isinf(probs).any() or probs.sum().item() == 0:
-            # print("Warning: Invalid probabilities in select_action. Falling back to random token from vocab.")
-            action = torch.randint(0, self.vocab_size, (1,), device=self.device).item()
-            log_prob = torch.log(torch.tensor(1.0 / self.vocab_size, device=self.device))
-        else:
-            action_tensor = torch.multinomial(probs, num_samples=1) 
-            action = action_tensor.item() 
-            log_prob = torch.log(probs.squeeze(0)[action]) if probs.size(0) == 1 else torch.log(probs[0, action])
-
-        return action, log_prob
-
-    def update_policy(self, rewards: List[float], log_probs: List[torch.Tensor], gamma: float = 0.99):
-        if not rewards or not log_probs:
-            return
-
-        discounted_returns = []
-        R = 0
-        for r in reversed(rewards):
-            R = r + gamma * R
-            discounted_returns.insert(0, R)
-        
-        discounted_returns = torch.tensor(discounted_returns, device=self.device)
-        
-        if len(discounted_returns) > 1:
-            discounted_returns = (discounted_returns - discounted_returns.mean()) / (discounted_returns.std() + 1e-9)
-        elif len(discounted_returns) == 1:
-             discounted_returns = (discounted_returns - discounted_returns.mean()) / (torch.abs(discounted_returns.mean()) + 1e-9)
+    # --- 1. Script Configuration ---
+    sft_model_path = "./fw14k-gsm8k-sft"
+    dataset_name = "openai/gsm8k"
+    dataset_config = "main" 
+    grpo_output_dir = "./fw14k-gsm8k-sft-grpo-refined-reward" # Updated output dir name
+    use_subset = True 
+    subset_size = 200 
 
 
-        policy_loss = []
-        for log_prob, G_t in zip(log_probs, discounted_returns):
-            if isinstance(log_prob, torch.Tensor): 
-                policy_loss.append(-log_prob * G_t)
-            else:
-                continue 
-        
-        if not policy_loss:
-            return
+    print("--- GRPO Training Configuration (Refined Reward) ---")
+    print(f"SFT model path: {sft_model_path}")
+    print(f"Dataset: {dataset_name} (config: {dataset_config})")
+    print(f"GRPO output directory: {grpo_output_dir}")
+    print(f"Using subset of dataset: {use_subset} (size: {subset_size if use_subset else 'all'})")
+    print("-----------------------------------\n")
 
-        self.optimizer.zero_grad()
-        policy_loss_tensor = torch.stack(policy_loss).sum() 
-        policy_loss_tensor.backward()
-        self.optimizer.step()
+    # --- 2. Load SFT Model and Tokenizer ---
+    print(f"Loading SFT model from: {sft_model_path}")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(sft_model_path)
+        tokenizer = AutoTokenizer.from_pretrained(sft_model_path)
+        print("SFT Model and Tokenizer loaded successfully.")
+    except Exception as e:
+        print(f"Error loading SFT model or tokenizer from {sft_model_path}: {e}")
+        print("Please ensure the path is correct and the SFT model was saved properly.")
+        sys.exit(1)
 
-def train_one_episode(policy: GRPOPolicy, env: RLEnvironment, initial_prompt: str, max_episode_steps: int = 50, temperature: float = 1.0, top_k: int = 50) -> Tuple[List[float], List[torch.Tensor]]:
-    current_env_state = env.reset(initial_prompt_text=initial_prompt)
-    collected_rewards = []
-    collected_log_probs = []
+    if tokenizer.pad_token is None or tokenizer.pad_token_id is None:
+        print("Tokenizer does not have a pad_token. Setting pad_token = eos_token.")
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id 
+    
+    tokenizer.padding_side = "left" 
+    
+    if model.config.pad_token_id != tokenizer.pad_token_id:
+        print(f"Updating model.config.pad_token_id from {model.config.pad_token_id} to {tokenizer.pad_token_id}")
+        model.config.pad_token_id = tokenizer.pad_token_id
 
-    # Check if reset state is valid (not empty)
-    if current_env_state is None or current_env_state.nelement() == 0:
-        print(f"Error: Environment reset with prompt '{initial_prompt}' resulted in empty state. Skipping episode.")
-        return collected_rewards, collected_log_probs
+    print(f"Tokenizer configured: pad_token='{tokenizer.pad_token}', pad_token_id={tokenizer.pad_token_id}, padding_side='{tokenizer.padding_side}'")
+    print("-----------------------------------\n")
 
-    for step_num in range(max_episode_steps):
-        current_env_state = current_env_state.to(policy.device) 
-        
-        action, log_prob = policy.select_action(current_env_state, temperature=temperature, top_k=top_k)
-        next_env_state, reward, done = env.step(action)
-        
-        collected_rewards.append(reward)
-        collected_log_probs.append(log_prob)
-        
-        current_env_state = next_env_state
-        if done:
-            break
-            
-    return collected_rewards, collected_log_probs
+    # --- 3. Prepare Dataset for GRPOTrainer ---
+    print(f"Loading dataset: {dataset_name} (config: {dataset_config})")
+    full_dataset = load_dataset(dataset_name, name=dataset_config, split="train")
+    print(f"Full dataset loaded. Number of examples: {len(full_dataset)}")
+
+    def prepare_prompts(example):
+        return {"prompt": example["question"], "answer": example["answer"]}
+
+    print("Processing dataset to create 'prompt' and 'answer' columns...")
+    dataset_map_num_proc = os.cpu_count() // 2 if os.cpu_count() and os.cpu_count() > 2 else 1
+    if use_subset:
+        print(f"Selecting a subset of {subset_size} examples for processing.")
+        actual_subset_size = min(subset_size, len(full_dataset))
+        processed_dataset = full_dataset.select(range(actual_subset_size)).map(
+            prepare_prompts, 
+            num_proc=dataset_map_num_proc,
+            remove_columns=[col for col in full_dataset.column_names if col not in ["question", "answer"]]
+        )
+    else:
+        processed_dataset = full_dataset.map(
+            prepare_prompts,
+            num_proc=dataset_map_num_proc,
+            remove_columns=[col for col in full_dataset.column_names if col not in ["question", "answer"]]
+        )
+    
+    print(f"Dataset processed. Number of examples in processed_dataset: {len(processed_dataset)}")
+    print(f"Columns in processed_dataset: {processed_dataset.column_names}")
+    if len(processed_dataset) > 0:
+        print(f"First example - Prompt: {processed_dataset[0]['prompt'][:100]}...")
+        # print(f"First example - Answer (for reward): {processed_dataset[0]['answer'][:100]}...") # For debugging
+    print("-----------------------------------\n")
+    
+    # --- 4. Initialize GRPOConfig ---
+    print("Initializing GRPOConfig...")
+    config = GRPOConfig(
+        output_dir=grpo_output_dir,
+        learning_rate=5e-7, 
+        batch_size=16,      
+        mini_batch_size=2,  
+        gradient_accumulation_steps=4, 
+        log_with="none",    
+        kl_penalty="kl",    
+        beta=0.02,          
+        adap_kl_ctrl=False, 
+        max_prompt_length=512,      
+        max_completion_length=512,  
+        logging_steps=5, # Log more frequently with refined reward
+        save_steps=10, # Save more frequently for smaller datasets/testing
+        ppo_epochs=2,       
+        num_iterations=2, # Keep low for quick test with refined reward
+    )
+    print("GRPOConfig initialized.")
+    print(f"  Output directory: {config.output_dir}")
+    print(f"  Learning rate: {config.learning_rate}")
+    print(f"  Num iterations: {config.num_iterations}")
+    print("-----------------------------------\n")
+
+    # --- 5. Instantiate GRPOTrainer ---
+    print("Instantiating GRPOTrainer...")
+    trainer = GRPOTrainer(
+        model=model,
+        args=config,
+        train_dataset=processed_dataset, 
+        reward_funcs=[reasoning_reward_function], 
+        processing_class=tokenizer, 
+    )
+    print("GRPOTrainer instantiated.")
+    print("-----------------------------------\n")
+
+    # --- 6. Training Loop ---
+    print("Starting GRPO training with refined reward function...")
+    try:
+        trainer.train() 
+        print("GRPO training completed.")
+    except Exception as e:
+        print(f"An error occurred during GRPOTrainer.train(): {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1) 
+    print("-----------------------------------\n")
+
+    # --- 7. Save Model ---
+    print(f"Saving GRPO fine-tuned model to {grpo_output_dir}...")
+    try:
+        trainer.save_model(grpo_output_dir)
+        print(f"GRPO fine-tuned model (and tokenizer) saved successfully to {grpo_output_dir}")
+    except Exception as e:
+        print(f"An error occurred during model saving: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("-----------------------------------\n")
+    print("GRPO training script finished.")
 
 
 if __name__ == '__main__':
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    out_dir = "out" 
-    ckpt_path = os.path.join(out_dir, "ckpt.pt")
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"Attempting to load model from {ckpt_path}...")
-
-    learning_rate = 1e-5 # Further reduced LR for HF tokenizer
-    num_episodes = 20    
-    max_steps_per_episode = 30 
-    rl_temperature = 0.8 
-    rl_top_k = 40        
-    
-    prompts = [
-        "The problem with modern art is", 
-        "Once upon a time, in a kingdom built on clouds", 
-        "To truly understand recursion, one must first understand the nature of a mirror.", 
-        "The key to effective machine learning is often found in",
-        "A spaceship drifted silently through the void, its only passenger a cat named"
-    ]
-
-    try:
-        model = load_pretrained_model(checkpoint_path=ckpt_path, device=device, out_dir=out_dir)
-        print("Pretrained model loaded successfully.")
-
-        try:
-            tokenizer_name = "KoboldAI/llama2-tokenizer"
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-            if tokenizer.pad_token_id is None:
-                tokenizer.pad_token = tokenizer.eos_token 
-                print(f"Set tokenizer.pad_token_id to tokenizer.eos_token_id ({tokenizer.eos_token_id})")
-            if tokenizer.bos_token_id is None: # Llama tokenizer might have bos_token but not bos_token_id set in some HF versions
-                if hasattr(tokenizer, 'bos_token') and isinstance(tokenizer.bos_token, str):
-                    tokenizer.bos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.bos_token)
-                print(f"Set tokenizer.bos_token_id to {tokenizer.bos_token_id}")
-
-        except Exception as e:
-            print(f"Error loading tokenizer {tokenizer_name}: {e}")
-            print("Please ensure you have `transformers` and `sentencepiece` installed and internet connectivity.")
-            print("Install with: pip install transformers sentencepiece")
-            sys.exit(1)
-        
-        print(f"Hugging Face tokenizer '{tokenizer_name}' loaded. Vocab size: {tokenizer.vocab_size}")
-        print(f"BOS ID: {tokenizer.bos_token_id}, EOS ID: {tokenizer.eos_token_id}, PAD ID: {tokenizer.pad_token_id}")
-
-
-        if hasattr(model, 'params') and model.params.vocab_size != tokenizer.vocab_size:
-            print(f"Warning: Model vocab size ({model.params.vocab_size}) and tokenizer vocab size ({tokenizer.vocab_size}) differ.")
-            # This is a critical warning. For GRPO, we will use tokenizer.vocab_size for the policy.
-            # The model's output layer should ideally match this. If not, it might lead to issues.
-            # Consider re-initializing the model's output layer if this mismatch is problematic.
-            # For now, GRPOPolicy will use tokenizer.vocab_size.
-        
-        # Use tokenizer.model_max_length if available, else model.params.block_size
-        env_max_seq_len = tokenizer.model_max_length if hasattr(tokenizer, 'model_max_length') and tokenizer.model_max_length < 10000 else model.params.block_size
-        env = RLEnvironment(model_for_max_len=model, tokenizer=tokenizer, device=device, max_seq_len=min(env_max_seq_len, 256))
-        
-        policy = GRPOPolicy(model=model, tokenizer=tokenizer, device=device, learning_rate=learning_rate)
-        
-        model.train() 
-        print("Model set to train() mode for GRPO.")
-
-        # Optional: Test generation after model load and with new tokenizer
-        # print("\nTesting generation with loaded model and new tokenizer...")
-        # test_prompt = "Hello, world! My name is"
-        # test_start_tokens = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=True).to(device)
-        # if test_start_tokens.size(1) == 0: 
-        #    test_start_tokens = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long, device=device)
-        # generated_output_test = model.generate(test_start_tokens, max_new_tokens=20)
-        # generated_text_test = tokenizer.decode(generated_output_test[0], skip_special_tokens=True)
-        # print(f"Test prompt: '{test_prompt}'")
-        # print(f"Generated text: '{generated_text_test}'\n")
-
-
-        print(f"\nStarting GRPO training for {num_episodes} episodes...")
-        all_episode_rewards = []
-
-        for episode_num in range(num_episodes):
-            current_prompt = prompts[episode_num % len(prompts)]
-            
-            rewards, log_probs = train_one_episode(
-                policy, 
-                env, 
-                initial_prompt=current_prompt,
-                max_episode_steps=max_steps_per_episode,
-                temperature=rl_temperature,
-                top_k=rl_top_k
-            )
-            
-            if not rewards or not log_probs:
-                print(f"Episode {episode_num + 1}/{num_episodes}: No data collected. Prompt: '{current_prompt[:30]}...'. Skipping update.")
-                continue
-
-            policy.update_policy(rewards, log_probs) 
-            
-            total_reward_episode = sum(rewards)
-            all_episode_rewards.append(total_reward_episode)
-            print(f"Episode {episode_num + 1}/{num_episodes}: Total Reward: {total_reward_episode:.3f}, Steps: {len(rewards)}, Prompt: '{current_prompt[:30]}...'")
-            
-            if (episode_num + 1) % 10 == 0: 
-                if all_episode_rewards:
-                    avg_reward = sum(all_episode_rewards[-10:]) / len(all_episode_rewards[-10:])
-                    print(f"Average reward for last 10 episodes: {avg_reward:.3f}")
-
-        print("\nGRPO training complete.")
-
-        fine_tuned_model_path = os.path.join(out_dir, "grpo_fine_tuned_ckpt_hf_tokenizer.pt")
-        model_params_to_save = {}
-        if hasattr(model, 'params') and model.params is not None:
-             if isinstance(model.params, ModelArgs): 
-                 model_params_to_save = vars(model.params)
-             else: 
-                 try: model_params_to_save = dict(model.params)
-                 except: print("Warning: Could not serialize model.params to dict for saving.")
-
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': policy.optimizer.state_dict(),
-            'model_args': model_params_to_save, 
-            'grpo_config': { 
-                'learning_rate': learning_rate, 'num_episodes': num_episodes,
-                'max_steps_per_episode': max_steps_per_episode, 'rl_temperature': rl_temperature,
-                'rl_top_k': rl_top_k, 'tokenizer_name': tokenizer.name_or_path
-            }
-        }, fine_tuned_model_path)
-        print(f"Fine-tuned model and GRPO config saved to {fine_tuned_model_path}")
-
-    except FileNotFoundError:
-        print(f"Error: Checkpoint file not found at {ckpt_path}. Ensure 'out/ckpt.pt' exists for pretraining.")
-    except AttributeError as e:
-        print(f"AttributeError: {e}. This might be due to differences in model structure or ModelArgs.")
-        import traceback
-        traceback.print_exc()
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-
-    print("\ntrain-rl.py execution finished.")
+    print("Executing GRPO training script: train-rl.py (with refined reward function)")
+    run_grpo_training()
+    print("Script execution complete.")
