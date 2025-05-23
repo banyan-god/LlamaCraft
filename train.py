@@ -202,11 +202,7 @@ if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model)  # requires PyTorch 2.0
+
 
 # wrap model into FSDP container (full‑shard for lower VRAM)
 if ddp:
@@ -221,7 +217,11 @@ if ddp:
         mixed_precision=mp_policy,
         device_id=ddp_local_rank,
     )
-
+# compile the model
+if compile:
+    print("compiling the model... (takes a ~minute)")
+    unoptimized_model = model
+    model = torch.compile(model)  # requires PyTorch 2.0
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
