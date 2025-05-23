@@ -46,13 +46,13 @@ class Task:
         self.tokenizer.pad_token = self.tokenizer.eos_token
         vocab_size = self.tokenizer.vocab_size
         
-        if not dist.is_initialized():
-            # select appropriate distributed backend based on device availability
-            backend = 'nccl' if torch.cuda.is_available() else 'gloo'
-            dist.init_process_group(backend=backend)
-
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+        # determine rank and world size; assume single-process if not initialized
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
         
         self.initialized = False
         self.initialize()        
