@@ -28,7 +28,7 @@ from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 # Switched from classic DDP to Fully‑Sharded Data Parallel
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import enable_wrap, wrap
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 
 import bitsandbytes as bnb
 
@@ -210,10 +210,17 @@ if compile:
 
 # wrap model into FSDP container (full‑shard for lower VRAM)
 if ddp:
-    # Auto‑wrap every sub‑module so parameters, grads and optimizer states are sharded
-    with enable_wrap(wrapper_cls=FSDP, mixed_precision=torch.bfloat16):
-        model = wrap(model)
-    model = FSDP(model, mixed_precision=torch.bfloat16, device_id=ddp_local_rank)
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+    model = FSDP(
+        model,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=mp_policy,
+        device_id=ddp_local_rank,
+    )
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
