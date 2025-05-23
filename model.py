@@ -297,7 +297,7 @@ class Transformer(nn.Module):
         # else:
         #     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         #     print("using torch.optim.AdamW fallback")
-        optimizer = AdamW8bit(optim_groups, lr=learning_rate, betas=betas)
+        optimizer = AdamW4bit(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
