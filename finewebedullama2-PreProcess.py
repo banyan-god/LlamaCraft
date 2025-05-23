@@ -25,23 +25,23 @@ class Task:
 
     def initialize(self):
 
-        dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-100BT", split="train", streaming=False,num_proc=20)
+        dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=False,num_proc=24)
         train_dataset, val_dataset = dataset.train_test_split(test_size=0.1).values()
 
         
         columns_to_remove = ['id', 'url', 'text', 'dump', 'file_path', 'language', 'language_score', 'token_count', 'score', 'int_score']
         print("Tokenizing train");
-        tokenized_datasets = train_dataset.map(self.tokenize_function, batched=True, num_proc=20, remove_columns=columns_to_remove)
+        tokenized_datasets = train_dataset.map(self.tokenize_function, batched=True, num_proc=24, remove_columns=columns_to_remove)
         tokenized_datasets.save_to_disk('data/tokenized_datasets')
         print("Tokenizing val");
-        tokenized_val_datasets = val_dataset.map(self.tokenize_function, batched=True, num_proc=20,remove_columns=columns_to_remove)
+        tokenized_val_datasets = val_dataset.map(self.tokenize_function, batched=True, num_proc=24,remove_columns=columns_to_remove)
         tokenized_val_datasets.save_to_disk('data/tokenized_val_datasets')
 
 
 
     def tokenize_function(self, examples):
         # Tokenize the text (without adding special tokens)
-        tokenized_output = self.tokenizer(examples['text'], truncation=True, max_length=self.block_size-1, add_special_tokens=False)
+        tokenized_output = self.tokenizer(examples['text'],  truncation=True, max_length=self.block_size-1, add_special_tokens=False)
         
         # Manually add BOS and EOS tokens to each example
         input_ids = []
@@ -56,6 +56,6 @@ class Task:
         
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    task=Task(8,device,1024);
+    task=Task(4,device,1024);
 
 

@@ -3,7 +3,10 @@ import struct
 import inspect
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
-import bitsandbytes as bnb
+try:
+    import bitsandbytes as bnb
+except ImportError:
+    bnb = None
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -145,7 +148,7 @@ class Attention(nn.Module):
 
         # flash implementation
         if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True,enable_gqa=True)
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -285,12 +288,18 @@ class Transformer(nn.Module):
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(bnb.optim.AdamW8bit).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = bnb.optim.AdamW8bit(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        # Create optimizer: fused 8-bit AdamW if available and using CUDA, else fallback to CPU AdamW
+        use_fused = (
+            bnb is not None
+            and 'fused' in inspect.signature(bnb.optim.AdamW8bit).parameters
+            and device_type == 'cuda'
+        )
+        if use_fused:
+            optimizer = bnb.optim.AdamW8bit(optim_groups, lr=learning_rate, betas=betas, fused=True)
+            print("using fused AdamW8bit")
+        else:
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
+            print("using torch.optim.AdamW fallback")
 
         return optimizer
 

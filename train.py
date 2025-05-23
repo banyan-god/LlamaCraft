@@ -132,7 +132,7 @@ ctx = (
 )
 print(ptdtype)
 
-data=Task(batch_size,device,1024);
+data=Task(batch_size,device,max_seq_len);
 # task-specific setup
 iter_batches = partial(
     data.iter_batches
@@ -250,6 +250,7 @@ t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
+X, Y = None, None
 try:
     while True:
         # determine and set the learning rate for this iteration

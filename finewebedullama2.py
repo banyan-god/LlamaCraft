@@ -6,34 +6,31 @@ import torch.distributed as dist
 from datasets.distributed import split_dataset_by_node
 from datasets import load_from_disk
 
-def custom_collate_fn(batch, block_size, tokenize_fn, pad_token_id):
+def custom_collate_fn(batch, block_size, prepare_inputs_and_labels, pad_token_id):
     # Flatten the batch list to create a long list of sequences
     batch = [item for sublist in batch for item in sublist['input_ids']]
     
     input_ids = []
-    labels = []
-    while len(batch) >= block_size + 1:  # +1 to account for both input and label
+    while len(batch) >= block_size + 1:
         current_input_ids = torch.tensor(batch[:block_size + 1])
         input_ids.append(current_input_ids[:-1])
-        labels.append(current_input_ids[1:])
         
-        # Remove those tokens from the batch list
+        # Remove processed tokens
         batch = batch[block_size:]
     
-    # Drop any remaining tokens if they don't form a full block
+    # Drop remaining tokens if incomplete
     if len(batch) < block_size + 1:
-        batch = []  # This effectively drops the last incomplete sequence
+        batch = []
 
-    # Stack the inputs and labels
+    # Stack the inputs
     input_ids = torch.stack(input_ids)
-    labels = torch.stack(labels)
-    
-    # Create the dictionary format expected by tokenize_function
-    tokenized_output = {'input_ids': input_ids, 'labels': labels}
-    
-    # Pass the batch through the tokenize_function
-    tokenized_output = tokenize_fn(tokenized_output)
-    
+
+    # Package into the dictionary
+    tokenized_output = {'input_ids': input_ids}
+
+    # Pass through the tokenization/preparation function
+    tokenized_output = prepare_inputs_and_labels(tokenized_output)
+
     return tokenized_output
 
 
@@ -50,7 +47,9 @@ class Task:
         vocab_size = self.tokenizer.vocab_size
         
         if not dist.is_initialized():
-            dist.init_process_group(backend='nccl')  # Adjust as per your setup
+            # select appropriate distributed backend based on device availability
+            backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+            dist.init_process_group(backend=backend)
 
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -60,28 +59,68 @@ class Task:
         
         
     def initialize(self):
-        #dataset from finewebedullama2-preprocess 
+        # Load datasets
         train_dataset = load_from_disk('data/tokenized_datasets')
         val_dataset = load_from_disk('data/tokenized_val_datasets')
+    
+        # Set dataset format
         train_dataset = train_dataset.with_format("torch")
         val_dataset = val_dataset.with_format("torch")
-
-
-        # tokenized_datasets = tokenized_datasets.with_format("torch")
-        # tokenized_val_datasets=tokenized_val_datasets.with_format("torch")
-        train_sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True)
-        val_sampler = DistributedSampler(val_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False)
-
-        self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, sampler=train_sampler, num_workers=8,prefetch_factor=8, persistent_workers=True, pin_memory=True ,     collate_fn=lambda batch: custom_collate_fn(batch, self.block_size, self.tokenize_function, self.tokenizer.pad_token_id))
-        self.val_loader = DataLoader(val_dataset, batch_size=self.batch_size,sampler=val_sampler, num_workers=8,prefetch_factor=8, persistent_workers=True,  pin_memory=True, 
-      collate_fn=lambda batch: custom_collate_fn(batch, self.block_size, self.tokenize_function, self.tokenizer.pad_token_id))
+    
+        # Create samplers
+        train_sampler = DistributedSampler(
+            train_dataset, 
+            num_replicas=self.world_size, 
+            rank=self.rank, 
+            shuffle=True
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, 
+            num_replicas=self.world_size, 
+            rank=self.rank, 
+            shuffle=False
+        )
+    
+        # Create data loaders
+        self.train_loader = DataLoader(
+            train_dataset, 
+            batch_size=self.batch_size, 
+            sampler=train_sampler, 
+            num_workers=8, 
+            prefetch_factor=8, 
+            persistent_workers=True, 
+            pin_memory=True,
+            collate_fn=lambda batch: custom_collate_fn(
+                batch, 
+                self.block_size, 
+                self.prepare_inputs_and_labels, 
+                self.tokenizer.pad_token_id
+            )
+        )
+        self.val_loader = DataLoader(
+            val_dataset, 
+            batch_size=self.batch_size, 
+            sampler=val_sampler, 
+            num_workers=8, 
+            prefetch_factor=8, 
+            persistent_workers=True, 
+            pin_memory=True,
+            collate_fn=lambda batch: custom_collate_fn(
+                batch, 
+                self.block_size, 
+                self.prepare_inputs_and_labels, 
+                self.tokenizer.pad_token_id
+            )
+        )
+    
+        # Mark initialization as complete
         self.initialized = True
-        
-    def tokenize_function(self,tokenized_output):
 
+        
+    def prepare_inputs_and_labels(self, tokenized_output):
         input_ids = tokenized_output['input_ids'].long()
         
-        # Create labels by shifting input_ids and appending -100 at the end of each sequence
+        # Create labels by shifting input_ids and appending -100
         labels = torch.cat([input_ids[:, 1:], torch.full((input_ids.size(0), 1), -100, dtype=torch.long)], dim=1)
         
         # Package the processed data back into the dictionary
@@ -89,6 +128,8 @@ class Task:
         tokenized_output['labels'] = labels
         
         return tokenized_output
+
+
     def iter_batches(self, split, start_index=0):
         if self.initialized == False:
             self.initialize()
