@@ -269,7 +269,7 @@ class Transformer(nn.Module):
 
         return logits
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, use_cpu_offload: bool = True):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, use_cpu_offload: bool = False):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
