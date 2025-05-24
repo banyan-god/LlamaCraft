@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torchao.optim import CPUOffloadOptimizer
 
 @dataclass
 class ModelArgs:
@@ -268,7 +269,7 @@ class Transformer(nn.Module):
 
         return logits
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, use_cpu_offload: bool = True):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -285,19 +286,24 @@ class Transformer(nn.Module):
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # # Create optimizer: fused 8-bit AdamW if available and using CUDA, else fallback to CPU AdamW
-        # use_fused = (
-        #     bnb is not None
-        #     and 'fused' in inspect.signature(bnb.optim.AdamW8bit).parameters
-        #     and device_type == 'cuda'
-        # )
-        # if use_fused:
-        #     optimizer = bnb.optim.AdamW8bit(optim_groups, lr=learning_rate, betas=betas, fused=True)
-        #     print("using fused AdamW8bit")
-        # else:
-        #     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
-        #     print("using torch.optim.AdamW fallback")
-        optimizer = AdamW4bit(optim_groups, lr=learning_rate, betas=betas)
+        # ------------------------------------------------------------------
+        # Choose the actual optimizer implementation.
+        # If `use_cpu_offload` is True we wrap AdamW4bit with CPUOffloadOptimizer
+        # to keep the model weights and (optionally) gradients on CPU memory.
+        # ------------------------------------------------------------------
+        if use_cpu_offload:
+            optimizer = CPUOffloadOptimizer(
+                optim_groups,          # parameter groups we prepared above
+                AdamW4bit,             # base optimizer class
+                offload_gradients=True,
+                lr=learning_rate,
+                betas=betas,
+            )
+            print("using AdamW4bit + CPUOffloadOptimizer (gradients off‑loaded to CPU)")
+        else:
+            optimizer = AdamW4bit(optim_groups, lr=learning_rate, betas=betas)
+            print("using AdamW4bit")
+
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
