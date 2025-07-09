@@ -27,6 +27,8 @@ import torch
 from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.profiler
+from torch.profiler import ProfilerActivity, schedule, tensorboard_trace_handler
 
 from finewebedullama2 import Task
 from export import model_export
@@ -251,7 +253,18 @@ if wandb_log and master_process:
     import wandb
     wandb_logger=wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-# training loop
+# training loop with memory profiler
+profiler_dir = os.path.join(out_dir, "profiler")
+if master_process:
+    os.makedirs(profiler_dir, exist_ok=True)
+profiler = torch.profiler.profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True,
+    on_trace_ready=tensorboard_trace_handler(profiler_dir)
+)
+profiler.start()
 batch_generator = iter_batches(split="train",start_index=0)
 # fetch the very first batch
 t0 = time.time()
@@ -353,6 +366,7 @@ try:
                 )
             iter_num += 1
             local_iter_num += 1
+            profiler.step()
         
             # termination conditions
         except StopIteration:  # Handle end of dataset
@@ -360,6 +374,8 @@ try:
             break
 except KeyboardInterrupt:
     print("Training interrupted manually.")
+
+profiler.stop()
 
 
     
