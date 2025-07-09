@@ -9,3 +9,4 @@ bitsandbytes
 datasets
 transformers
 torchao
+tensorboard
