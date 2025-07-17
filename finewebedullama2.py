@@ -53,6 +53,7 @@ class Task:
 
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        self.count = 0
         
         self.initialized = False
         self.initialize()        
@@ -152,8 +153,10 @@ class Task:
                 break 
     def process_batch(self, batch):
         # batch=self.tokenize_function(batch)
+        self.count += 1
         X = batch['input_ids'].detach().to(self.device, non_blocking=True)
         Y = batch['labels'].detach().to(self.device, non_blocking=True)
+        print(f"rank {self.rank} processed batch count {self.count}")
         return X, Y
 
 
