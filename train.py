@@ -66,7 +66,7 @@ n_kv_heads = 32
 multiple_of = 32
 dropout = 0.1
 # adamw optimizer
-gradient_accumulation_steps = 64  # used to simulate larger batch sizes
+gradient_accumulation_steps = 32  # used to simulate larger batch sizes
 learning_rate = 10e-4  # max learning rate
 max_iters = 200000  # total number of training iterations
 weight_decay = 1e-1
