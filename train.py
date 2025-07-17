@@ -146,7 +146,7 @@ data=Task(batch_size,device,1024);
 iter_batches = partial(
     data.iter_batches
 )
-
+print("Data task initialized with batch size", data.batch_size, "and max sequence length", data.block_size)
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
@@ -191,7 +191,7 @@ elif init_from == "resume":
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 model.to(device)
-
+print("Model initialized")
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler('cuda',enabled=(dtype == "float16"))
 
@@ -271,6 +271,7 @@ t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
+print("Starting training loop")
 try:
     while True:
         # determine and set the learning rate for this iteration
